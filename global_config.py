@@ -36,7 +36,7 @@ ModelConfig = {
     "model_config" : "./Model/PretrainedModel/config.json",
     "output_dir" : "./output",
     "pre_train_model" : "./Model/PretrainedModel/bert-base-chinese-model.bin",
-    "max_seq_length" : 64,
+    "max_seq_length" : 72,
     "train_batch_size" : 32,
     "eval_batch_size" : 256,
     "gradient_accumulation_steps" : 4,
