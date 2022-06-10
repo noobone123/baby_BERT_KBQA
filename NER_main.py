@@ -150,49 +150,104 @@ def flatten(inputs:list) -> list:
     [result.extend(line) for line in inputs]
     return result
 
-def evaluate(model, eval_dataset, device):
-    eval_sampler = SequentialSampler(eval_dataset)
-    eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler,
-                                 batch_size= ModelConfig["eval_batch_size"])
 
-    logger.info("***** Running evaluation *****")
-    logger.info("  Num examples = %d", len(eval_dataset))
-    logger.info("  Batch size = %d", ModelConfig["eval_batch_size"])
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
-    loss = []
-    real_token_label = []
-    pred_token_label = []
-    for batch in tqdm(eval_dataloader, desc="Evaluating"):
-        model.eval()
-        batch = tuple(t.to(device) for t in batch)
-        with torch.no_grad():
+
+def train(train_dataset, eval_dataset, model, device):
+
+    train_sampler = RandomSampler(train_dataset) # 随机抽取
+    train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=ModelConfig["train_batch_size"])
+
+    t_total = len(train_dataloader) // ModelConfig["gradient_accumulation_steps"] * ModelConfig["num_train_epochs"]
+
+    no_decay = ['bias', 'LayerNorm.weight','transitions']
+    optimizer_grouped_parameters = [
+        {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+         'weight_decay': ModelConfig["weight_decay"]},
+        {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
+    ]
+    optimizer = AdamW(optimizer_grouped_parameters,lr=ModelConfig["learning_rate"], eps=ModelConfig["adam_epsilon"])
+    '''
+    AdamW (
+    Parameter Group 0
+        betas: (0.9, 0.999)
+        correct_bias: True
+        eps: 1e-08
+        initial_lr: 5e-05
+        lr: 5e-05
+        weight_decay: 0.0
+    Parameter Group 1
+        betas: (0.9, 0.999)
+        correct_bias: True
+        eps: 1e-08
+        initial_lr: 5e-05
+        lr: 5e-05
+        weight_decay: 0.0
+    )
+    '''
+
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=ModelConfig["warmup_steps"], num_training_steps=t_total)
+    logger.info("***** Running training *****")
+    logger.info("  Num examples = %d", len(train_dataset))
+    logger.info("  Num Epochs = %d", ModelConfig["num_train_epochs"])
+    logger.info("  Gradient Accumulation steps = %d", ModelConfig["gradient_accumulation_steps"])
+    logger.info("  Total optimization steps = %d", t_total)
+
+    global_step = 0
+    tr_loss, logging_loss = 0.0, 0.0
+    model.zero_grad()
+    train_iterator = trange(int(ModelConfig["num_train_epochs"]), desc="Epoch")
+    set_seed(ModelConfig["seed"])
+
+    best_f1 = 0.
+    for _ in train_iterator:
+        epoch_iterator = tqdm(train_dataloader, desc="Iteration")
+        for step,batch in enumerate(epoch_iterator):
+            batch = tuple(t.to(device) for t in batch)
             inputs = {'input_ids':batch[0],
                       'attention_mask':batch[1],
                       'token_type_ids':batch[2],
                       'tags':batch[3],
-                      'decode':True,
-                      'reduction':'none'
+                      'decode':True
             }
+            
             outputs = model(**inputs)
-            # temp_eval_loss shape: (batch_size)
-            # temp_pred : list[list[int]] 长度不齐
-            temp_eval_loss, temp_pred = outputs[0], outputs[1]
+            
+            loss,pre_tag = outputs[0], outputs[1]
+            # loss 一个值，pre_tag[32,seq_len] seq_len是不固定的，句子长度 
 
-            loss.extend(temp_eval_loss.tolist())
-            pred_token_label.extend(temp_pred)
-            real_token_label.extend(statistical_real_sentences(batch[3],batch[1],temp_pred))
+            if ModelConfig["gradient_accumulation_steps"] > 1:
+                loss = loss / ModelConfig["gradient_accumulation_steps"]
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), ModelConfig["max_grad_norm"])
+            logging_loss += loss.item()
+            tr_loss += loss.item()
+            if 0 == (step + 1) % ModelConfig["gradient_accumulation_steps"]:
+                optimizer.step()
+                scheduler.step()
+                model.zero_grad()
+                global_step += 1
+                logger.info("EPOCH = [%d/%d] global_step = %d   loss = %f",_+1, ModelConfig["num_train_epochs"], global_step,
+                            logging_loss)
+                logging_loss = 0.0
 
-    loss = np.array(loss).mean()
-    real_token_label = np.array(flatten(real_token_label))
-    pred_token_label = np.array(flatten(pred_token_label))
-    assert real_token_label.shape == pred_token_label.shape
-    ret = classification_report(y_true = real_token_label,y_pred = pred_token_label,output_dict = True)
-    model.train()
-    return ret
+                # if (global_step < 100 and global_step % 10 == 0) or (global_step % 50 == 0):
+                # 每 相隔 100步，评估一次
+                if global_step % 10 == 0:
+                    best_f1 = evaluate_and_save_model(model,eval_dataset,_,global_step,best_f1, device)
 
-def evaluate_and_save_model(model, eval_dataset, epoch, global_step, best_f1, device):
+    # 最后循环结束 再评估一次
+    best_f1 = evaluate_and_save_model(model, eval_dataset,_,global_step, best_f1, device)
+
+
+def evaluate_and_save_model(model,eval_dataset,epoch,global_step,best_f1,device):
     ret = evaluate(model, eval_dataset, device)
 
+    # code.interact(local = locals())
     precision_b = ret['1']['precision']
     recall_b = ret['1']['recall']
     f1_b = ret['1']['f1-score']
@@ -228,91 +283,65 @@ def evaluate_and_save_model(model, eval_dataset, epoch, global_step, best_f1, de
     if avg_f1 > best_f1:
         best_f1 = avg_f1
 
-        eval_output_dirs = ModelConfig["output_dir"]
-        if not os.path.exists(eval_output_dirs):
-            os.makedirs(eval_output_dirs)
-        
-        model_file = os.path.join(ModelConfig["output_dir"], "best_ner.bin")
-        if os.path.exists(model_file):
-            os.remove(model_file)
+        model_path = os.path.join(ModelConfig["output_dir"], "best_ner.bin")
+        if os.path.exists(model_path):
+            os.remove(model_path)
 
-        torch.save(model.state_dict(), model_file)
+        torch.save(model.state_dict(), model_path)
         logging.info("save the best model %s,avg_f1= %f", os.path.join(ModelConfig["output_dir"], "best_bert.bin"),
                      best_f1)
-
     # 返回出去，用于更新外面的 最佳值
     return best_f1
 
 
-def train(train_dataset, eval_dataset, model, device):
-    train_sampler = RandomSampler(train_dataset)
-    train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=ModelConfig["train_batch_size"])
+def evaluate(model, eval_dataset, device):
 
-    t_total = len(train_dataloader)
-    no_decay = ['bias', 'LayerNorm.weight','transitions']
-    optimizer_grouped_parameters = [
-        {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-         'weight_decay': ModelConfig["weight_decay"]},
-        {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
-    ]
-    optimizer = AdamW(optimizer_grouped_parameters, lr = ModelConfig["learning_rate"], eps = ModelConfig["adam_epsilon"])
-    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=ModelConfig["warmup_steps"], num_training_steps=t_total)
+    eval_output_dirs = ModelConfig["output_dir"]
+    if not os.path.exists(eval_output_dirs):
+        os.makedirs(eval_output_dirs)
+    eval_sampler = SequentialSampler(eval_dataset) # 顺序采样
+    eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler,
+                                 batch_size=ModelConfig["eval_batch_size"])
 
-    logger.info("***** Running training *****")
-    logger.info("  Num examples = %d", len(train_dataset))
-    logger.info("  Num Epochs = %d", ModelConfig["num_train_epochs"])
-    logger.info("  Gradient Accumulation steps = %d", ModelConfig["gradient_accumulation_steps"])
-    logger.info("  Total optimization steps = %d", t_total)
+    logger.info("***** Running evaluation *****")
+    logger.info("  Num examples = %d", len(eval_dataset))
+    logger.info("  Batch size = %d", ModelConfig["eval_batch_size"])
 
-    global_step = 0
-    tr_loss, logging_loss = 0.0, 0.0
-    model.zero_grad()
-    train_iterator = trange(int(ModelConfig["num_train_epochs"]), desc="Epoch")
 
-    def set_seed(seed):
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-
-    set_seed(ModelConfig["seed"])
-
-    best_f1 = 0.
-    for _ in train_iterator:
-        epoch_iterator = tqdm(train_dataloader, desc="Iteration")
-        for step,batch in enumerate(epoch_iterator):
-            batch = tuple(t.to(device) for t in batch)
+    loss = []
+    real_token_label = []
+    pred_token_label = []
+    for batch in tqdm(eval_dataloader, desc="Evaluating"):
+        model.eval()
+        batch = tuple(t.to(device) for t in batch)
+        with torch.no_grad():
             inputs = {'input_ids':batch[0],
                       'attention_mask':batch[1],
                       'token_type_ids':batch[2],
-                      'tags':batch[3],
-                      'decode':True
+                      'tags':batch[3], # [batch_size,seq_length]
+                      'decode':True,
+                      'reduction':'none'
             }
+            
             outputs = model(**inputs)
-            loss, pre_tag = outputs[0], outputs[1]
+            # temp_eval_loss shape: (batch_size)
+            # temp_pred : list[list[int]] 长度不齐
+            temp_eval_loss, temp_pred = outputs[0], outputs[1]
 
-            if ModelConfig["gradient_accumulation_steps"] > 1:
-                loss = loss / ModelConfig["gradient_accumulation_steps"]
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), ModelConfig["max_grad_norm"])
-            logging_loss += loss.item()
-            tr_loss += loss.item()
+            loss.extend(temp_eval_loss.tolist())
+            pred_token_label.extend(temp_pred)
+            real_token_label.extend(statistical_real_sentences(batch[3],batch[1],temp_pred)) # [12]
 
-            if 0 == (step + 1) % ModelConfig["gradient_accumulation_steps"]:
-                optimizer.step()
-                scheduler.step()
-                model.zero_grad()
-                global_step += 1
-                logger.info("EPOCH = [%d/%d] global_step = %d   loss = %f",_+1, ModelConfig["num_train_epochs"], global_step,
-                            logging_loss)
-                logging_loss = 0.0
+    loss = np.array(loss).mean()
+    real_token_label = np.array(flatten(real_token_label)) # [[],[],...,[]]->[....]
+    pred_token_label = np.array(flatten(pred_token_label))
+    assert real_token_label.shape == pred_token_label.shape
+    
+    # len(real_token_label)=70778    len(pred_token_label)=70778
+    ret = classification_report(y_true = real_token_label,y_pred = pred_token_label,output_dict = True)
 
-                # if (global_step < 100 and global_step % 10 == 0) or (global_step % 50 == 0):
-                # 每 相隔 100步，评估一次
-                if global_step % 100 == 0:
-                    best_f1 = evaluate_and_save_model(model, eval_dataset, _ , global_step, best_f1, device)
-
-    # 最后循环结束 再评估一次
-    best_f1 = evaluate_and_save_model(model, eval_dataset, _ , global_step, best_f1, device)
+    model.train()
+    return ret
 
 
 def test(test_dataset, device):

@@ -59,11 +59,11 @@ class BERT_CRF(nn.Module):
             loss = None
             pass
         else:
-            new_tags = tags[:, 1:-1]
+            new_tags = tags[:,1:-1]
             loss = self.crf_model(emissions=new_emissions, tags=new_tags, mask=new_mask, reduction=reduction)
         
         if decode:
-            tag_list = self.crf_model.decode(emissions = new_emissions,mask = new_mask)
+            tag_list = self.crf_model.decode(emissions=new_emissions, mask=new_mask)
             return [loss, tag_list]
 
         return [loss]
